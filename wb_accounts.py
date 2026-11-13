@@ -4323,6 +4323,12 @@ class CreditsRefresher(threading.Thread):
     refresh age settles a little above the TTL. That is the intended trade:
     the preference is measured in days, so a few extra hours of drift is worth
     far less than the calls it saves.
+
+    The first tick after a start is the one exception to the half-hour rhythm:
+    it fires after FIRST_TICK_DELAY (20s) instead of a full interval, because a
+    restart would otherwise serve a stale on-disk snapshot for the whole first
+    tick. That adds at most one extra billing call per process start; the
+    steady-state cap of 48/day is unchanged.
     """
 
     def __init__(self, pool, interval_seconds=1800):
@@ -4426,9 +4432,24 @@ class CreditsRefresher(threading.Thread):
                             (" · " + tier["package"]) if tier.get("package") else ""))
             return account.uid
 
+    #: 启动后第一次 tick 的等待时间。
+    #:
+    #: 用短等待而不是「立刻刷」：`refresh_once()` 会同步打一次上游计费接口
+    #: （summary 超时 15 秒、CN 详细路径还有 30 秒的 fallback），放在进程启动
+    #: 的第一瞬间会和登录、面板首屏抢同一条出口。20 秒足够错开这些一次性工作，
+    #: 又远小于 30 分钟的常规间隔。
+    #:
+    #: 调用方（wb_proxy 的 _bootstrap_runtime）已经同步跑完 POOL.load() 和
+    #: SCHEDULER.start()，所以这里不需要靠等待来规避「池子还没填好」的竞态。
+    FIRST_TICK_DELAY = 20.0
+
     def run(self):
+        # 第一轮用最短延迟：重启后磁盘上的快照可能已经超过 TTL，等满一个
+        # interval_seconds 就意味着用户要盯着昨天（甚至前天）的数字半小时。
+        delay = self.FIRST_TICK_DELAY
         while not self._stop_event.is_set():
-            self._wake.wait(timeout=self.interval_seconds)
+            self._wake.wait(timeout=delay)
+            delay = self.interval_seconds
             if self._stop_event.is_set():
                 break
             self._wake.clear()
